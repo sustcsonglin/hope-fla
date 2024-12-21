@@ -12,17 +12,18 @@ This repo aims at providing a collection of efficient Triton-based implementatio
   <img width="400" alt="image" src="https://github.com/sustcsonglin/flash-linear-attention/assets/18402347/02ff2e26-1495-4088-b701-e72cd65ac6cf">
 </div>
 
-* [News](#news)
-* [Models](#models)
-* [Installation](#installation)
-* [Usage](#usage)
-  * [Token Mixing](#token-mixing)
-  * [Fused Modules](#fused-modules)
-  * [Generation](#generation)
-  * [Hybrid Models](#hybrid-models)
-* [Evaluations](#evaluations)
-* [Benchmarks](#benchmarks)
-* [Citation](#citation)
+- [:boom: Flash Linear Attention](#boom-flash-linear-attention)
+  - [News](#news)
+  - [Models](#models)
+  - [Installation](#installation)
+  - [Usage](#usage)
+    - [Token Mixing](#token-mixing)
+    - [Fused Modules](#fused-modules)
+    - [Generation](#generation)
+    - [Hybrid Models](#hybrid-models)
+  - [Evaluations](#evaluations)
+  - [Benchmarks](#benchmarks)
+  - [Citation](#citation)
 
 ## News
 
