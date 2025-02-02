@@ -420,6 +420,7 @@ def chunk_transform_qk_bwd_kernel(
     do,
     dv,
     dq,
+    dq_new,
     dk,
     dk2,
     dbeta,
@@ -474,23 +475,24 @@ def chunk_transform_qk_bwd_kernel(
 
     b_dkkT = -tl.dot(b_k_beta, tl.trans(b_dk).to(b_k.dtype))
     b_qk = tl.where(m_t, tl.dot(b_q, tl.trans(b_k)), 0)
+    p_T = tl.make_block_ptr(AT + i_bh * T * BT, (BT, T), (1, BT), (0, i_t * BT), (BT, BT), (0, 1))
+    b_Tt = tl.load(p_T, boundary_check=(0, 1))
 
-    p_T = tl.make_block_ptr(AT + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    b_T = tl.load(p_T, boundary_check=(0, 1))
+    # b_T = tl.load(p_T, boundary_check=(0, 1))
+
     # [m, n] x [n, k] = [m, k]
     # b_dT = tl.dot(tl.trans(b_qk), b_dqkT)
     # backward. [m, n] = [m, k] x [k, n]
-    b_dqk = tl.dot(b_dqkT, tl.trans(b_T))
+    b_dqk = tl.dot(b_dqkT, b_Tt)
     # qkT[m, k] x T[k, n] = dqkT[m, n]
-    b_dkk = tl.dot(b_dkkT, tl.trans(b_T))
+    b_dkk = tl.dot(b_dkkT, b_Tt)
 
     b_kk = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], tl.dot(b_k, tl.trans(b_k)), 0)
-
     b_dT = tl.dot(tl.trans(b_qk), b_dqkT) + tl.dot(tl.trans(b_kk), b_dkkT)
     b_dT = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], b_dT, 0)
-    b_dT = tl.dot(b_dT, tl.trans(b_T))
-    b_dT = tl.dot(tl.trans(b_T), b_dT)
-    b_dT = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], -b_dT, 0)
+    b_dT = tl.dot(b_dT, b_Tt)
+    b_dT = tl.dot(b_Tt, b_dT)
+    b_dT = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], -b_dT, 0).to(b_k.dtype)
 
     # b_dq, b_dk = tl.dot(b_T.to(b_dq.dtype), b_dq), tl.dot(b_T.to(b_dk.dtype), b_dk)
     # qk[m, n] x kbeta[n, k] = q[m, k]
@@ -500,10 +502,12 @@ def chunk_transform_qk_bwd_kernel(
     b_dq_final = tl.zeros([BT, K], dtype=tl.float32)
     b_dk_final = tl.zeros([BT, K], dtype=tl.float32)
     b_dbeta_final = tl.zeros([BT], dtype=tl.float32)
-    b_dk_final += tl.dot(tl.trans(b_dT).to(b_k.dtype), b_k_beta)
+    b_dk_final += tl.dot(tl.trans(b_dT), b_k_beta)
+    p_T = tl.make_block_ptr(AT + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    b_T = tl.load(p_T, boundary_check=(0, 1))
     b_qkT = tl.dot(b_qk, b_T)
     b_kkT = tl.dot(b_kk, b_T)
-    b_dkbeta = tl.dot(b_dT.to(b_k.dtype), b_k) -tl.dot(tl.trans(b_qkT.to(b_dq.dtype)), b_dq) - tl.dot(b_kkT.to(b_dk.dtype), b_dk)
+    b_dkbeta = tl.dot(b_dT, b_k) -tl.dot(tl.trans(b_qkT.to(b_dq.dtype)), b_dq) - tl.dot(b_kkT.to(b_dk.dtype), b_dk)
     b_dqk = tl.where(m_t, b_dqk, 0)
     b_dkk = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], b_dkk, 0)
     b_dq_final += tl.dot(b_dqk.to(b_k.dtype), b_k)
@@ -516,7 +520,9 @@ def chunk_transform_qk_bwd_kernel(
     b_dbeta_final += tl.sum(b_dkbeta * b_k, 1)
     p_dq = tl.make_block_ptr(dq + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, K), (1, 0))
     b_dq_final += tl.load(p_dq, boundary_check=(0, 1))
-    tl.store(p_dq, b_dq_final.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
+    ## HELP ME
+    p_dq_new = tl.make_block_ptr(dq_new + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, K), (1, 0))
+    tl.store(p_dq_new, b_dq_final.to(p_dq_new.dtype.element_ty), boundary_check=(0, 1))
     p_dk = tl.make_block_ptr(dk + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, K), (1, 0))
     b_dk_final += tl.load(p_dk, boundary_check=(0, 1))
     tl.store(p_dk, b_dk_final.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
@@ -889,7 +895,7 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
         q_new, k_new, _, A_local, _, _, _, _ = chunk_transform_qk_fwd_fn(q, k, v, beta, A, scale, BS, True)
 
         B, H, T, K = q.shape
-        A_local_larger = torch.empty(B, H, T, T, dtype=q.dtype, device=q.device)
+        A_local_larger = torch.empty(B, H, T, T, dtype=torch.float32, device=q.device)
         # should be something in this form here.       
         grid = (triton.cdiv(T, BT), B * H)
 
@@ -910,12 +916,13 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
             BT_large=BT_large
         )
 
-        dq = torch.empty_like(q)
+        dq = torch.zeros_like(q)
         dk = torch.zeros_like(k, dtype=torch.float32)
         dk2 = torch.zeros_like(k, dtype=torch.float32)
         dv = torch.zeros_like(v, dtype=torch.float32)
         grid = (triton.cdiv(T, BT), H*B)
-        dA = torch.empty_like(A_local_larger, dtype=q.dtype)
+        dA = torch.zeros_like(A_local_larger, dtype=torch.float32)
+
         parallel_softmax_delta_rule_bwd_kernel[grid](
             k=k_new,
             k2=k,
@@ -973,6 +980,7 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
         )
         grid = (triton.cdiv(T, BS), B * H)
         dbeta = torch.zeros_like(beta)
+        dq_new = torch.zeros_like(dq).fill_(float("nan"))
         chunk_transform_qk_bwd_kernel[grid](
             q=q,
             k=k,
@@ -985,6 +993,7 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
             do=do,
             dv=dv,
             dq=dq,
+            dq_new=dq_new,
             dk=dk,
             dk2=dk2,
             dbeta=dbeta,
@@ -997,8 +1006,7 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
             BV=BV,
             V=V
         )
-        return dq, dk, dv, dbeta, None, None
-
+        return dq_new, dk, dv, dbeta, None, None
 
 
 def parallel_hope(
@@ -1074,7 +1082,6 @@ def naive_delta_rule_parallel(q, k, v, beta, scale, BM=128, BN=64):
     l_origin = l
     l = q.shape[-2]
 
-    q = q * scale
     k_beta = k * beta[..., None]
     # compute (I - tri(diag(beta) KK^T))^{-1}
     q, k, v, k_beta = map(lambda x: rearrange(x, 'b h (n c) d -> b h n c d', c=BN), [q, k, v, k_beta])
@@ -1092,7 +1099,6 @@ def naive_delta_rule_parallel(q, k, v, beta, scale, BM=128, BN=64):
     k = k - ((k @ k.transpose(-1, -2)).masked_fill(mask, 0) @ T).transpose(-1, -2) @ k_beta
     # apply cumprod transition matrices on q to the first position within the chunk
     q = q - A_local @ k_beta
-    # o_intra = A_local @ v
 
     A = torch.zeros(b, h, l, l, device=q.device)
 
@@ -1129,19 +1135,20 @@ def naive_delta_rule_parallel(q, k, v, beta, scale, BM=128, BN=64):
 
 
 if __name__ == "__main__":
-    B, H, T, K, V = 2, 16, 2000, 64, 64
+    B, H, T, K, V = 2, 16, 2048, 64, 64
     torch.set_default_dtype(torch.bfloat16)
 
-    q = torch.rand(B, H, T, K).cuda()
-    k = torch.nn.functional.normalize(torch.rand(B, H, T, K).cuda(), p=2, dim=-1)
-    v = torch.rand(B, H, T, V).cuda()
+    q = torch.nn.functional.normalize(torch.randn(B, H, T, K).cuda(), p=2, dim=-1)
+    k = torch.nn.functional.normalize(torch.randn(B, H, T, K).cuda(), p=2, dim=-1)
+    v = torch.randn(B, H, T, V).cuda()
     beta = torch.rand(B, H, T).sigmoid().cuda() 
     # beta = torch.ones(B, H, T).cuda()
+
     q, k, v, beta = map(lambda x: x.requires_grad_(True), [q, k, v, beta])
     output_attentions = True
     # with torch.no_grad():
     ref_attn = naive_delta_rule_parallel(q.clone(), k.clone(), v.clone(), beta.clone(), K**-0.5)
-    ref_o = ref_attn.float().softmax(-1).to(v) @ v
+    ref_o = (ref_attn.float() * K**-0.5).softmax(-1).to(v) @ v
     do = torch.randn_like(ref_o)
     ref_o.backward(do)
 
@@ -1153,12 +1160,10 @@ if __name__ == "__main__":
     o2 = parallel_hope(q, k, v, beta, K**-0.5)
     assert_close('o', ref_o, o2, 0.005)
     o2.backward(do, retain_graph=True)
-
     print(get_err_ratio(q_grad, q.grad), (q_grad-q.grad).abs().max())
     print(get_err_ratio(k_grad, k.grad), (k_grad-k.grad).abs().max())
     print(get_err_ratio(v_grad, v.grad), (v_grad-v.grad).abs().max())
     print(get_err_ratio(beta_grad, beta.grad), (beta_grad-beta.grad).abs().max())
-    print("changing dtype")
     breakpoint()
 
     # q_grad = q.grad.clone()
