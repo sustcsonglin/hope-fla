@@ -1000,7 +1000,7 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
         return dq, dk, dv, dbeta, None, None
 
 
-def parallel_delta_rule(
+def parallel_hope(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,

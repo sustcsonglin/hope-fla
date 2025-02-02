@@ -14,7 +14,8 @@ from einops import rearrange
 from transformers.utils import logging
 
 from fla.modules import RotaryEmbedding
-from fla.ops.hope.fused_recurrent import householder_attention
+from fla.ops.hope.parallel import parallel_hope
+
 
 
 if TYPE_CHECKING:
@@ -65,10 +66,11 @@ class HoPEAttention(nn.Module):
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
-        self.w_proj = nn.Sequential(
-            nn.Linear(self.hidden_size, 16, bias=False),
-            nn.Linear(16, self.hidden_size, bias=False)
-        )
+        self.beta_proj = nn.Linear(self.hidden_size, self.num_heads, bias=True)
+        # self.w_proj = nn.Sequential(
+        #     nn.Linear(self.hidden_size, 16, bias=False),
+        #     nn.Linear(16, self.hidden_size, bias=False)
+        # )
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.rotary = RotaryEmbedding(self.head_dim)
         self.householder_block_size = householder_block_size
@@ -106,18 +108,20 @@ class HoPEAttention(nn.Module):
         # assert attention_mask is None, "HoPEAttention requires attention_mask to be provided."
         batch_size, q_len, _ = hidden_states.size()
         q, k, v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
-        w = self.w_proj(hidden_states)
+        beta = self.beta_proj(hidden_states).sigmoid()
+
         if attention_mask is not None:
             v = (torch.mul if self.training else torch.mul_)(v, attention_mask[:, -v.shape[1]:, None])
-        o = householder_attention(q=q, k=k, w=w, v=v, householder_block_size=self.householder_block_size, head_size=self.head_dim)
-        o = o.reshape(batch_size, q_len, self.hidden_size)
-        breakpoint()
+        
+        q, k, v = map(lambda x: rearrange(x, "b n (h d) -> b n h d", h=self.num_heads), (q, k, v))
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        beta = beta.transpose(1, 2)
+        o = parallel_hope(q, k, v, beta)
+        o = rearrange(o, "b h n d -> b n (h d)")
         o = self.o_proj(o)
         if not output_attentions:
             attentions = None
         return o, attentions, past_key_values
-
-
 
 
     def _upad_input(self, q, k, v, attention_mask, q_len):
@@ -146,3 +150,12 @@ class HoPEAttention(nn.Module):
             q, indices_q, cu_seqlens_q, max_seqlen_q = unpad_input(q, attention_mask)
 
         return q, k, v, indices_q, (cu_seqlens_q, cu_seqlens_k), (max_seqlen_q, max_seqlen_k)
+
+
+if __name__ == "__main__":
+    layer = HoPEAttention(hidden_size=2048, num_heads=32).cuda().to(torch.bfloat16)
+    hidden_states = torch.randn(8, 1024, 2048).cuda().to(torch.bfloat16)
+
+    o, attentions, past_key_values = layer(hidden_states)
+    breakpoint()
+
