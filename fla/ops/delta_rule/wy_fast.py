@@ -510,7 +510,7 @@ def fwd_prepare_T(
     BC = min(BT, 32)
 
     BK = min(triton.next_power_of_2(K), 64)
-    A = torch.empty(B, *((H, T) if head_first else (T, H)), BT, device=k.device, dtype=k.dtype)
+    A = torch.empty(B, *((H, T) if head_first else (T, H)), BT, device=k.device, dtype=torch.float32)
     fwd_fn = fwd_prepare_wy_repr_kernel_chunk64 if BT == 64 else fwd_prepare_wy_repr_kernel_chunk32
     fwd_fn[(NT, B * H)](
         k=k,
