@@ -164,8 +164,9 @@ def parallel_softmax_delta_rule_bwd_kernel_dk(
 
     # p_v = tl.make_block_ptr(v + i_bh * T * K, (V, T), (1, V), (0, i_t * BT), (BK, BT), (0, 1))
     # b_v = tl.load(p_v, boundary_check=(0, 1))
-    
-    for offset in range(T - BS, i_t * BT, -BS):
+
+
+    for offset in range(tl.cdiv(T, BS) * BS - BS, i_t * BT, -BS):
         # p_k = tl.make_block_ptr(k + i_bh * T * K, (T, K), (K, 1), (offset, 0), (BS, BK), (1, 0))
         # b_k = tl.load(p_k, boundary_check=(0, 1))
         m_s = tl.arange(0, BT) < (offset - i_t * BT)
@@ -888,7 +889,7 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
         q_new, k_new, _, A_local, _, _, _, _ = chunk_transform_qk_fwd_fn(q, k, v, beta, A, scale, BS, True)
 
         B, H, T, K = q.shape
-        A_local_larger = torch.empty(B, H, T, T, dtype=torch.bfloat16, device=q.device)
+        A_local_larger = torch.empty(B, H, T, T, dtype=q.dtype, device=q.device)
         # should be something in this form here.       
         grid = (triton.cdiv(T, BT), B * H)
 
@@ -914,8 +915,7 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
         dk2 = torch.zeros_like(k, dtype=torch.float32)
         dv = torch.zeros_like(v, dtype=torch.float32)
         grid = (triton.cdiv(T, BT), H*B)
-        dA = torch.empty_like(A_local_larger, dtype=q.dtype).fill_(float("-inf"))
-
+        dA = torch.empty_like(A_local_larger, dtype=q.dtype)
         parallel_softmax_delta_rule_bwd_kernel[grid](
             k=k_new,
             k2=k,
@@ -1000,6 +1000,7 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
         return dq, dk, dv, dbeta, None, None
 
 
+
 def parallel_hope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1041,4 +1042,197 @@ def parallel_hope(
         o = o.transpose(1, 2)
     return o
 
- 
+
+def get_abs_err(x, y):
+    return (x-y).flatten().abs().max().item()
+
+
+def get_err_ratio(x, y):
+    err = (x-y).flatten().square().mean().sqrt().item()
+    base = (x).flatten().square().mean().sqrt().item()
+    return err / base
+
+
+def assert_close(prefix, ref, tri, ratio):
+    msg = f"{prefix} diff: {get_abs_err(ref, tri):.6f} ratio: {get_err_ratio(ref, tri):.6f}"
+    print(msg)
+    assert get_err_ratio(ref, tri) < ratio, msg
+
+
+
+
+def naive_delta_rule_parallel(q, k, v, beta, scale, BM=128, BN=64):
+    
+
+    original_dtype = q.dtype
+    q, k, v, beta = map(lambda x: x.to(torch.float32), [q, k, v, beta])
+    b, h, l, d_k = q.shape
+    if l % BM != 0:
+        padding_size = BM - l % BM
+        q, k, v = map(lambda x: torch.nn.functional.pad(x, (0, 0, 0, padding_size)), [q, k, v])
+        beta = torch.nn.functional.pad(beta, (0, padding_size))
+    l_origin = l
+    l = q.shape[-2]
+
+    q = q * scale
+    k_beta = k * beta[..., None]
+    # compute (I - tri(diag(beta) KK^T))^{-1}
+    q, k, v, k_beta = map(lambda x: rearrange(x, 'b h (n c) d -> b h n c d', c=BN), [q, k, v, k_beta])
+    mask = torch.triu(torch.ones(BN, BN, dtype=torch.bool, device=q.device), diagonal=0)
+    T = -(k_beta @ k.transpose(-1, -2)).masked_fill(mask, 0)
+    for i in range(1, BN):
+        T[..., i, :i] = T[..., i, :i].clone() + (T[..., i, :, None].clone() * T[..., :, :i].clone()).sum(-2)
+    T = T + torch.eye(BN, dtype=q.dtype, device=q.device)
+
+    mask2 = torch.triu(torch.ones(BN, BN, dtype=torch.bool, device=q.device), diagonal=1)
+    A_local = (q @ k.transpose(-1, -2)).masked_fill(mask2, 0) @ T
+    o_intra = A_local @ v
+
+    # apply cumprod transition matrices on k to the last position within the chunk
+    k = k - ((k @ k.transpose(-1, -2)).masked_fill(mask, 0) @ T).transpose(-1, -2) @ k_beta
+    # apply cumprod transition matrices on q to the first position within the chunk
+    q = q - A_local @ k_beta
+    # o_intra = A_local @ v
+
+    A = torch.zeros(b, h, l, l, device=q.device)
+
+    q, k, v, k_beta, o_intra = map(lambda x: rearrange(x, 'b h n c d -> b h (n c) d'), [q, k, v, k_beta, o_intra])
+    o = torch.empty_like(v)
+    for i in range(0, l, BM):
+        q_i = q[:, :, i:i+BM].clone()
+        # o_i = o_intra[:, :, i:i+BM]
+        # intra block
+        for j in range(i + BM - 2 * BN, i-BN, -BN):
+            k_j = k[:, :, j:j+BN]
+            A_ij = q_i @ k_j.transpose(-1, -2)
+            mask = torch.arange(i, i+BM) >= (j + BN)
+            A_ij = A_ij.masked_fill_(~mask[:, None].to(A_ij.device), 0)
+            A[:, :, i:i+BM, j:j+BN] = A_ij
+            q_i = q_i - A_ij @ k_beta[:, :, j:j+BN]
+            # o_i += A_ij @ v[:, :, j:j+BN]
+        # inter block
+        for j in range(i - BN, -BN, -BN):
+            k_j = k[:, :, j:j+BN]
+            A_ij = q_i @ k_j.transpose(-1, -2)
+            A[:, :, i:i+BM, j:j+BN] = A_ij
+            q_i = q_i - A_ij @ k_beta[:, :, j:j+BN]
+            # o_i += A_ij @ v[:, :, j:j+BN]
+
+    for i in range(0, l//BN):
+        A[:, :, i*BN:i*BN+BN, i*BN:i*BN+BN] = A_local[:, :, i]
+    
+    A = A.masked_fill_(~torch.tril(torch.ones(l, l, device=q.device, dtype=torch.bool)), float("-inf"))
+    A = A[:, :, :l_origin, :l_origin]
+    return A
+
+
+
+
+if __name__ == "__main__":
+    B, H, T, K, V = 2, 16, 2000, 64, 64
+    torch.set_default_dtype(torch.bfloat16)
+
+    q = torch.rand(B, H, T, K).cuda()
+    k = torch.nn.functional.normalize(torch.rand(B, H, T, K).cuda(), p=2, dim=-1)
+    v = torch.rand(B, H, T, V).cuda()
+    beta = torch.rand(B, H, T).sigmoid().cuda() 
+    # beta = torch.ones(B, H, T).cuda()
+    q, k, v, beta = map(lambda x: x.requires_grad_(True), [q, k, v, beta])
+    output_attentions = True
+    # with torch.no_grad():
+    ref_attn = naive_delta_rule_parallel(q.clone(), k.clone(), v.clone(), beta.clone(), K**-0.5)
+    ref_o = ref_attn.float().softmax(-1).to(v) @ v
+    do = torch.randn_like(ref_o)
+    ref_o.backward(do)
+
+    q_grad, q.grad = q.grad.clone(), None
+    k_grad, k.grad = k.grad.clone(), None
+    v_grad, v.grad = v.grad.clone(), None
+    beta_grad, beta.grad = beta.grad.clone(), None
+
+    o2 = parallel_hope(q, k, v, beta, K**-0.5)
+    assert_close('o', ref_o, o2, 0.005)
+    o2.backward(do, retain_graph=True)
+
+    print(get_err_ratio(q_grad, q.grad), (q_grad-q.grad).abs().max())
+    print(get_err_ratio(k_grad, k.grad), (k_grad-k.grad).abs().max())
+    print(get_err_ratio(v_grad, v.grad), (v_grad-v.grad).abs().max())
+    print(get_err_ratio(beta_grad, beta.grad), (beta_grad-beta.grad).abs().max())
+    print("changing dtype")
+    breakpoint()
+
+    # q_grad = q.grad.clone()
+    # v_grad = v.grad.clone()
+    # k_grad = k.grad.clone()
+    # beta_grad = beta.grad.clone()
+    # scale = K**-0.5
+    # BN = 64
+    # BM = 128
+
+    # # with torch.no_grad():
+    # original_dtype = q.dtype
+    # q2, k2, v2, beta2 = map(lambda x: x.to(torch.float32).detach().clone().requires_grad_(True), [q, k, v, beta])
+    # q = q2.clone()
+    # k = k2.clone()
+    # v = v2.clone()
+    # beta = beta2.clone()
+    # b, h, l, d_k = q.shape
+    # # q = q * scale
+
+    # k_beta = k * beta[..., None]
+    # # compute (I - tri(diag(beta) KK^T))^{-1}
+    # q, k, v, k_beta = map(lambda x: rearrange(x, 'b h (n c) d -> b h n c d', c=BN), [q, k, v, k_beta])
+    # mask = torch.triu(torch.ones(BN, BN, dtype=torch.bool, device=q.device), diagonal=0)
+    # T = -(k_beta @ k.transpose(-1, -2)).masked_fill(mask, 0)
+    # for i in range(1, BN):
+    #     T[..., i, :i] = T[..., i, :i].clone() + (T[..., i, :, None].clone() * T[..., :, :i].clone()).sum(-2)
+    # T = T + torch.eye(BN, dtype=q.dtype, device=q.device)
+    # # T = T.clone().detach()
+
+    # mask2 = torch.triu(torch.ones(BN, BN, dtype=torch.bool, device=q.device), diagonal=1)
+    # A_local = (q @ k.transpose(-1, -2)).masked_fill(mask2, 0) @ T
+    # # o_intra = A_local @ v
+
+    # # apply cumprod transition matrices on k to the last position within the chunk
+    # k = k - ((k @ k.transpose(-1, -2)).masked_fill(mask, 0) @ T).transpose(-1, -2) @ k_beta
+    # # apply cumprod transition matrices on q to the first position within the chunk
+    # q = q - A_local @ k_beta
+    # A = torch.zeros(b, h, l, l, device=q.device)
+
+    # q_origin, k, v, k_beta = map(lambda x: rearrange(x, 'b h n c d -> b h (n c) d'), [q, k, v, k_beta])
+
+    # for i in range(0, l, BM):
+    #     q_i = q_origin[:, :, i:i+BM].clone()
+    #     # o_i = o_intra[:, :, i:i+BM]
+    #     # intra block
+    #     for j in range(i + BM - 2 * BN, i-BN, -BN):
+    #         k_j = k[:, :, j:j+BN]
+    #         A_ij = q_i @ k_j.transpose(-1, -2)
+    #         mask = torch.arange(i, i+BM) >= (j + BN)
+    #         A_ij = A_ij.masked_fill_(~mask[:, None].to(A_ij.device), 0)
+    #         A[:, :, i:i+BM, j:j+BN] = A_ij
+    #         q_i = q_i - A_ij @ k_beta[:, :, j:j+BN]
+    #         # o_i += A_ij @ v[:, :, j:j+BN]
+    #     # inter block
+    #     for j in range(i - BN, -BN, -BN):
+    #         k_j = k[:, :, j:j+BN]
+    #         A_ij = q_i @ k_j.transpose(-1, -2)
+    #         A[:, :, i:i+BM, j:j+BN] = A_ij
+    #         q_i = q_i - A_ij @ k_beta[:, :, j:j+BN]
+    #         # o_i += A_ij @ v[:, :, j:j+BN]
+
+    # for i in range(0, l//BN):
+    #     A[:, :, i*BN:i*BN+BN, i*BN:i*BN+BN] = A_local[:, :, i]
+    
+    # A = A.masked_fill_(~torch.tril(torch.ones(l, l, device=q.device, dtype=torch.bool)), float("-inf"))
+    # o3 = (A.to(torch.float32) * scale).softmax(-1).to(v) @ v
+    # o3.backward(do)
+    # print(get_err_ratio(o3, o2))
+    # print(get_err_ratio(o3, ref_o))
+    # print(get_err_ratio(o2, ref_o))
+    # # (q_grad - q_origin.grad)[:,:,64]
+    # print(get_err_ratio(q_grad, q2.grad))
+    # print(get_err_ratio(v_grad, v2.grad))
+    # print(get_err_ratio(k_grad, k2.grad))
+    # print(get_err_ratio(beta_grad, beta2.grad))
+    # breakpoint()
