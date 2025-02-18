@@ -10,7 +10,6 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-
 from fla.ops.delta_rule.wy_fast import fwd_prepare_T
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, contiguous
 
@@ -65,9 +64,6 @@ def parallel_softmax_delta_rule_bwd_kernel(
     l = tl.load(p_L, boundary_check=(0, ))
     curr_end = (tl.floor(i_t * BT / BT_large).to(tl.int32) * BT_large).to(tl.int32) 
 
-    # p_q = tl.make_block_ptr(q_large + ((1*B*H) + i_bh) * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
-    # b_q = tl.load(p_q, boundary_check=(0, 1))
-
     b_q = tl.zeros([BT, BK], dtype=tl.float32)
 
     for offset in range(0, curr_end, BS):
@@ -81,7 +77,7 @@ def parallel_softmax_delta_rule_bwd_kernel(
         p_hc = tl.make_block_ptr(hc + (i_bh * NT + tl.cdiv(offset, BS)) * K * K, (K, K), (K, 1), (0, 0), (BK, BK), (1, 0))
         b_hc = tl.load(p_hc, boundary_check=(0, 1))
         b_q2 = b_q - tl.dot(b_q.to(b_hc.dtype), b_hc)
-        b_dh = -tl.dot(tl.trans(b_q2), b_dq)
+        b_dh = -tl.dot(tl.trans(b_q2), b_dq.to(b_q2.dtype))
         tl.atomic_add(dh + (i_bh * NT + tl.cdiv(offset, BS)) * K * K + tl.arange(0, K)[:, None] * K + tl.arange(0, K)[None, :], b_dh, sem='relaxed')
 
         b_A = tl.dot(b_q2.to(b_k.dtype), tl.trans(b_k))
@@ -103,7 +99,164 @@ def parallel_softmax_delta_rule_bwd_kernel(
         
         b_dq_new -= tl.dot(b_dq.to(b_h.dtype), b_h)
         b_dq += b_dq_new
+
+    p_dq = tl.make_block_ptr(dq + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    tl.store(p_dq, b_dq.to(dq.dtype.element_ty), boundary_check=(0, 1))
+
+
+
+# todo: to make k2 already k * beta[:, None]. 
+# episold
+@triton.jit
+def parallel_softmax_delta_rule_bwd_kernel_stage3(
+    ko,
+    qo,
+    w,
+    beta,
+    AT,
+    dA_local,
+    dq_new,
+    dk_new,
+    dw,
+    dk,
+    dbeta,
+    dh,
+    T: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    NT: tl.constexpr
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+
+    b_dk = tl.zeros([BT, BK], dtype=tl.float32)
+    b_dw_beta = tl.zeros([BT, BK], dtype=tl.float32)
+    b_dw = tl.zeros([BT, BK], dtype=tl.float32)
+    b_dT = tl.zeros([BT, BT], dtype=tl.float32)
     
+    p_qo = tl.make_block_ptr(qo + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    p_ko = tl.make_block_ptr(ko + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    p_w = tl.make_block_ptr(w + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    p_beta = tl.make_block_ptr(beta + i_bh * T, (T, ), (1, ), (i_t * BT, ), (BT, ), (0, ))
+    p_T = tl.make_block_ptr(AT + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    b_w = tl.load(p_w, boundary_check=(0, 1))
+    b_beta = tl.load(p_beta, boundary_check=(0, ))
+    b_qo = tl.load(p_qo, boundary_check=(0, 1))
+    b_ko = tl.load(p_ko, boundary_check=(0, 1))
+    b_T = tl.load(p_T, boundary_check=(0, 1)).to(b_ko.dtype)
+    b_w_beta = (b_w * b_beta[:, None]).to(b_w.dtype)
+    o_i = tl.arange(0, BT)
+    b_qw = tl.where(o_i[:, None] >= o_i[None, :], tl.dot(b_qo, tl.trans(b_w)), 0).to(b_qo.dtype)
+    b_wbk = tl.where(o_i[:, None] > o_i[None, :], tl.dot(b_w_beta, tl.trans(b_ko)), 0).to(b_ko.dtype)
+    b_Twb = tl.dot(b_T, b_w_beta).to(b_w.dtype)
+    b_Twbk = tl.dot(b_T, b_wbk).to(b_w.dtype)
+    # Twbk part
+    p_dA_local = tl.make_block_ptr(dA_local + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    b_dA_local = tl.load(p_dA_local, boundary_check=(0, 1))
+    b_dk += tl.dot(tl.trans(b_dA_local), b_qo)
+    p_dk_new = tl.make_block_ptr(dk_new + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    b_dk_new = tl.load(p_dk_new, boundary_check=(0, 1))
+    b_dk += b_dk_new
+    b_dTwbk = -tl.dot(tl.trans(b_qw), b_dA_local.to(b_qw.dtype)) - tl.dot(b_w, tl.trans(b_dk_new.to(b_w.dtype)))
+    b_dw -= tl.dot(b_Twbk, b_dk_new.to(b_w.dtype))
+    b_dT += tl.dot(b_dTwbk.to(b_wbk.dtype), tl.trans(b_wbk))
+    b_dwbk = tl.where(o_i[:, None] > o_i[None, :], tl.dot(tl.trans(b_T), b_dTwbk.to(b_T.dtype)), 0).to(b_w.dtype)
+    b_dw_beta += tl.dot(b_dwbk, b_ko)
+    b_dk += tl.dot(tl.trans(b_dwbk), b_w_beta)
+    p_dk = tl.make_block_ptr(dk + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    tl.store(p_dk, b_dk.to(dk.dtype.element_ty), boundary_check=(0, 1))
+
+    # # Twb part
+    p_dh = tl.make_block_ptr(dh + (i_bh * NT + i_t) * K * K, (K, K), (K, 1), (0, 0), (BK, BK), (1, 0))
+    b_dh = tl.load(p_dh, boundary_check=(0, 1)).to(b_w.dtype)
+    b_dw += tl.dot(b_Twb, tl.trans(b_dh))
+    p_dq_new = tl.make_block_ptr(dq_new + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    b_dq_new = tl.load(p_dq_new, boundary_check=(0, 1))
+    b_dTwb = (-tl.dot(tl.trans(b_qw), b_dq_new) + tl.dot(b_w, b_dh)).to(b_w.dtype)
+    # # [A, C] = [B, A].t() @ [B, C] from h = w.transpose(-1, -2) @ Twb
+    b_dT += tl.dot(b_dTwb, tl.trans(b_w_beta))
+    b_dw_beta += tl.dot(tl.trans(b_T), b_dTwb)
+
+    # matrix inverse's gradient
+    p_T = tl.make_block_ptr(AT + i_bh * T * BT, (BT, T), (1, BT), (0, i_t * BT), (BT, BT), (0, 1))
+    b_Tt = tl.load(p_T, boundary_check=(0, 1))
+    b_dT = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], b_dT, 0)
+    b_dT = tl.dot(b_dT, b_Tt)
+    b_dT = tl.dot(b_Tt, b_dT)
+    b_dT = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], -b_dT, 0).to(b_ko.dtype)
+    b_dw_beta += tl.dot(b_dT, b_w)
+    b_dw += tl.dot(tl.trans(b_dT), b_w_beta)
+    b_dw += b_dw_beta * b_beta[:, None]
+    b_dbeta = tl.sum(b_dw_beta * b_w, axis=1)
+
+    tl.atomic_add(dw + i_bh * T * K + (i_t * BT + tl.arange(0, BT)[:, None]) * K + tl.arange(0, BK)[None, :], b_dw)
+    p_dbeta = tl.make_block_ptr(dbeta + i_bh * T, (T, ), (1, ), (i_t * BT, ), (BT, ), (0, ))
+    tl.store(p_dbeta, b_dbeta, boundary_check=(0, ))
+
+
+
+
+
+
+
+# todo: to make k2 already k * beta[:, None]. 
+@triton.jit
+def parallel_softmax_delta_rule_bwd_kernel_stage2(
+    q,
+    k,
+    v,  
+    qo,
+    ko,
+    w,
+    beta,
+    AT,
+    h,
+    hc,
+    A,
+    A_local,
+    dA,
+    dA_local,
+    do,
+    dq,
+    dq_new,
+    dk,
+    dh,
+    dv,
+    dw,
+    D, # delta
+    L, # logsumexp
+    scale,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    T: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BS: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    NT: tl.constexpr,
+    NT_large: tl.constexpr,
+    BT_large: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    p_do = tl.make_block_ptr(do + i_bh * T * V, (T, V), (V, 1), (i_t * BT, 0), (BT, BV), (1, 0))
+    # [BT, BV]
+    b_do = tl.load(p_do, boundary_check=(0, 1))
+    # [BT, BK]
+    # b_dq = tl.zeros([BT, BK], dtype=tl.float32)
+    sm_scale = scale * 1.44269504
+
+    p_delta = tl.make_block_ptr(D + i_bh * T, (T, ), (1, ), (i_t * BT, ), (BT, ), (0, ))
+    delta = tl.load(p_delta, boundary_check=(0, ))
+    p_L = tl.make_block_ptr(L + i_bh * T, (T, ), (1, ), (i_t * BT, ), (BT, ), (0, ))
+    l = tl.load(p_L, boundary_check=(0, ))
+    curr_end = (tl.floor(i_t * BT / BT_large).to(tl.int32) * BT_large).to(tl.int32) 
+
+    p_dq = tl.make_block_ptr(dq + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    b_dq = tl.zeros([BT, BK], dtype=tl.float32)
+    b_dq += tl.load(p_dq, boundary_check=(0, 1))
+
     p_q = tl.make_block_ptr(q + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     b_q = tl.load(p_q, boundary_check=(0, 1))
 
@@ -116,9 +269,7 @@ def parallel_softmax_delta_rule_bwd_kernel(
             p_h = tl.make_block_ptr(h + (i_bh * NT + tl.cdiv(i_t_small, BS)) * K * K, (K, K), (K, 1), (0, 0), (BK, BK), (1, 0))
             b_h = tl.load(p_h, boundary_check=(0, 1))
             b_q2 -= tl.dot(b_q2.to(b_h.dtype), b_h)
-        
         b_dh = -tl.dot(tl.trans(b_q2), b_dq)
-        
         tl.atomic_add(dh + (i_bh * NT + tl.cdiv(offset, BS)) * K * K + tl.arange(0, K)[:, None] * K + tl.arange(0, K)[None, :], b_dh, sem='relaxed')
         b_A = tl.dot(b_q2.to(b_k.dtype), tl.trans(b_k))
         b_A_softmax = tl.math.exp2(b_A * sm_scale - l[:, None])
@@ -135,8 +286,55 @@ def parallel_softmax_delta_rule_bwd_kernel(
         tl.atomic_add(dk + i_bh * T * K + (offset + tl.arange(0, BS))[:, None] * K + tl.arange(0, BK)[None, :], b_dk, sem='relaxed')
         b_dq_new -= tl.dot(b_dq.to(b_h.dtype), b_h)
         b_dq += b_dq_new
+
+    p_dq_new = tl.make_block_ptr(dq_new + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    tl.store(p_dq_new, b_dq.to(dq_new.dtype.element_ty), boundary_check=(0, 1))
+
+    p_A = tl.make_block_ptr(A_local + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    b_A_local = tl.load(p_A, boundary_check=(0, 1))
+    b_A_local = tl.where(tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :], b_A_local, -float("inf"))
+    b_A_softmax = tl.math.exp2(b_A_local * 1.44269504 - l[:, None])
+    b_dv = tl.dot(tl.trans(b_do), b_A_softmax.to(b_do.dtype))
+    tl.atomic_add(dv + i_bh * T * V + (i_t * BT + tl.arange(0, BS))[None, :] * V + tl.arange(0, BK)[:, None], b_dv, sem='relaxed')
+            
+    p_v = tl.make_block_ptr(v + i_bh * T * K, (V, T), (1, V), (0, i_t * BT), (BK, BT), (0, 1))
+    b_v = tl.load(p_v, boundary_check=(0, 1))
+    b_dp = tl.dot(b_do, b_v)
+    b_dA = ((b_dp - delta[:, None]) * b_A_softmax * scale).to(b_v.dtype)
+    
+    p_dA = tl.make_block_ptr(dA_local + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    tl.store(p_dA, b_dA, boundary_check=(0, 1))
+    
+
+    # k_origin 
+    p_ko = tl.make_block_ptr(ko + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    b_ko = tl.load(p_ko, boundary_check=(0, 1))
+    # p_qo = tl.make_block_ptr(qo + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    # b_qo = tl.load(p_qo, boundary_check=(0, 1))
+    p_w = tl.make_block_ptr(w + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    b_w = tl.load(p_w, boundary_check=(0, 1))
+    p_T = tl.make_block_ptr(AT + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
+    b_T = tl.load(p_T, boundary_check=(0, 1)).to(b_w.dtype)
+    p_beta = tl.make_block_ptr(beta + i_bh * T, (T, ), (1, ), (i_t * BT, ), (BT, ), (0, ))
+    b_beta = tl.load(p_beta, boundary_check=(0, ))
+    b_w_beta = (b_w * b_beta[:, None]).to(b_w.dtype)
+    b_Twb = tl.dot(b_T, b_w_beta).to(b_w.dtype)
+    b_wbk = tl.dot(b_w_beta, tl.trans(b_ko)).to(b_ko.dtype)
+    # note that diagonal is masked here
+    b_wbk = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], b_wbk, 0)
+    b_Twbk = tl.dot(b_T, (b_wbk).to(b_T.dtype)).to(b_T.dtype)
+
+    b_dqw = -tl.dot(b_dA, tl.trans(b_Twbk)) - tl.dot(b_dq.to(b_Twb.dtype), tl.trans(b_Twb))
+    b_dqw = tl.where(tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :], b_dqw, 0)
+    b_dq += tl.dot(b_dA.to(b_ko.dtype), b_ko)
+    b_dq += tl.dot(b_dqw.to(b_w.dtype), b_w)
+    p_qo = tl.make_block_ptr(qo + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    b_qo = tl.load(p_qo, boundary_check=(0, 1))
+    b_dw = tl.dot(tl.trans(b_dqw.to(b_qo.dtype)), b_qo)
     p_dq = tl.make_block_ptr(dq + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     tl.store(p_dq, b_dq.to(dq.dtype.element_ty), boundary_check=(0, 1))
+    p_dw = tl.make_block_ptr(dw + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    tl.store(p_dw, b_dw.to(dw.dtype.element_ty), boundary_check=(0, 1))
 
 
 
@@ -225,7 +423,7 @@ def chunk_cumprod_householder_fwd2_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=2),
+        # triton.Config({}, num_warps=1),
         triton.Config({}, num_warps=4),
     ],
     key=["BT", "K", "V"],
@@ -265,36 +463,36 @@ def chunk_transform_qk_fwd_kernel(
     p_k = tl.make_block_ptr(k + i_bh * T * K, (K, T), (1, K), (0, i_t * BT), (BK, BT), (0, 1))
     p_w = tl.make_block_ptr(w + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     p_v = tl.make_block_ptr(v + i_bh * T * V, (T, V), (V, 1), (i_t * BT, 0), (BT, BV), (1, 0))
-    b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
-    b_kt = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
-    b_v = tl.load(p_v, boundary_check=(0, 1)).to(tl.float32)
-    b_w = tl.load(p_w, boundary_check=(0, 1)).to(tl.float32)
+    b_q = tl.load(p_q, boundary_check=(0, 1))
+    b_kt = tl.load(p_k, boundary_check=(0, 1))
+    b_v = tl.load(p_v, boundary_check=(0, 1))
+    b_w = tl.load(p_w, boundary_check=(0, 1))
     p_T = tl.make_block_ptr(A + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    b_T = tl.load(p_T, boundary_check=(0, 1))
+    b_T = tl.load(p_T, boundary_check=(0, 1)).to(b_q.dtype)
 
     o_i = tl.arange(0, BT)
     m_t = o_i[:, None] >= o_i[None, :]
     # b_T = tl.where(m_t, b_T, 0)
   
     p_beta = tl.make_block_ptr(beta + i_bh * T, (T, ), (1, ), (i_t * BT, ), (BT, ), (0, ))
-    b_beta = tl.load(p_beta, boundary_check=(0, )).to(tl.float32)
-    b_w_beta = (b_w * b_beta[:, None])
+    b_beta = tl.load(p_beta, boundary_check=(0, ))
+    b_w_beta = (b_w * b_beta[:, None]).to(b_w.dtype)
     
-    b_Twb = tl.dot(b_T, b_w_beta)
+    b_Twb = tl.dot(b_T.to(b_w_beta.dtype), b_w_beta).to(b_w_beta.dtype)
     b_h = tl.dot(tl.trans(b_w), b_Twb)
     p_h = tl.make_block_ptr(h + (i_bh * NT + i_t) * K * K, (K, K), (K, 1), (0, 0), (BK, BK), (1, 0))
     tl.store(p_h, b_h.to(p_h.dtype.element_ty), boundary_check=(0, 1))
 
-    b_qw = tl.where(m_t, tl.dot(b_q, tl.trans(b_w)), 0)
+    b_qw = tl.where(m_t, tl.dot(b_q, tl.trans(b_w)), 0).to(b_q.dtype)
     # crucial to disallow tf32 heree.
-    b_qwT = tl.dot(b_qw, b_T, allow_tf32=False)
-    b_wbk = tl.where(o_i[:, None] > o_i[None, :], tl.dot(b_w_beta, b_kt), 0)
-    b_A = tl.where(m_t, tl.dot(b_q, b_kt) - tl.dot(b_qwT, b_wbk, allow_tf32=False), 0)
-    
+    b_qwT = tl.dot(b_qw, b_T).to(b_q.dtype)
+    b_wbk = tl.where(o_i[:, None] > o_i[None, :], tl.dot(b_w_beta, b_kt), 0).to(b_w.dtype)
+    b_A = tl.where(m_t, tl.dot(b_q, b_kt) - tl.dot(b_qwT, b_wbk), 0)
+ 
     b_q = b_q - tl.dot(b_qwT, b_w_beta)
     p_q_new = tl.make_block_ptr(q_new + i_bh * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, K), (1, 0))
     tl.store(p_q_new, b_q.to(p_q_new.dtype.element_ty), boundary_check=(0, 1))
-    b_T_wbk = tl.dot(b_T, b_wbk)
+    b_T_wbk = tl.dot(b_T, b_wbk).to(b_w.dtype)
     b_kt = b_kt - tl.dot(tl.trans(b_w), b_T_wbk)
     p_k_new = tl.make_block_ptr(k_new + i_bh * T * K, (K, T), (1, K), (0, i_t * BT), (BK, BT), (0, 1))
     tl.store(p_k_new, b_kt.to(p_k_new.dtype.element_ty), boundary_check=(0, 1))
@@ -452,10 +650,10 @@ def chunk_transform_qk_fwd_fn(q, k, v, w, beta, A, scale, BT, output_attentions)
     NT = triton.cdiv(T, BT)
     grid = (NT, B*H)
     V = v.shape[-1]
-    A_local = torch.zeros_like(A).fill_(float("-inf")) if output_attentions else None
+    A_local = torch.empty_like(A) if output_attentions else None
     L = torch.empty(B, H, T, dtype=torch.float32, device=q.device)
     M = torch.empty(B, H, T, dtype=torch.float32, device=q.device)
-    h = torch.zeros(B, H, NT, K, K, dtype=torch.float32, device=q.device)
+    h = torch.empty(B, H, NT, K, K, dtype=q.dtype, device=q.device)
     chunk_transform_qk_fwd_kernel[grid](
     q=q,
     k=k,
@@ -479,6 +677,7 @@ def chunk_transform_qk_fwd_fn(q, k, v, w, beta, A, scale, BT, output_attentions)
     BT=BT,
     OUTPUT_ATTENTIONS=output_attentions,
     )
+
 
     # q, k, v, w, beta = map(lambda x: x.to(torch.float32), [q, k, v, w, beta])
     # w_beta = w * beta[..., None]
@@ -643,15 +842,15 @@ def parallel_delta_rule_bwd_prepare_kernel(
         b_h = tl.load(p_h, boundary_check=(0, 1))
         # [BS]
         # [BT, BS]
-        # m_s = tl.arange(0, BT) >= (offset - i_t*BT + BS)
+        m_s = tl.arange(0, BT) >= (offset - i_t*BT + BS)
         # b_s = tl.dot(b_q.to(b_k.dtype), b_k)
         # b_s = tl.where(m_s[:, None], b_s, 0)
         # if OUTPUT_ATTENTIONS:
         # p_a = tl.make_block_ptr(attn + i_bh * T * BT_large, (T, BT_large), (BT_large, 1), (i_t * BT, offset - curr_end), (BT, BS), (1, 0))
         # tl.store(p_a, b_s.to(p_a.dtype.element_ty), boundary_check=(0, 1))
         b_q_minus = tl.dot(b_q.to(b_h.dtype), b_h)
-        b_q -= b_q_minus
-
+        b_q = tl.where(m_s[:, None], b_q - b_q_minus, b_q)
+    
     p_q_last = tl.make_block_ptr(q_large + (tl.cdiv(curr_end, BT_large) * B * H + i_bh) * T * K, (T, K), (K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     tl.store(p_q_last, b_q.to(p_q_last.dtype.element_ty), boundary_check=(0, 1))
     
@@ -766,11 +965,11 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
         A = fwd_prepare_T(w, beta, None,  None, True, BS)
         q_new, k_new, h, o, _, L, M, _, _ = chunk_transform_qk_fwd_fn(q, k, v, w, beta, A, scale, BS, False)
         num_stages = 3 if K <= 64 else 2
-        num_warps = 4
+        num_warps = 8
         grid = (triton.cdiv(T, BT), B * H)
         o_new = torch.empty_like(o)
         L_new = torch.empty_like(L)
-        # attn = torch.zeros(B, H, T, T, device=q.device)
+
         parallel_delta_rule_fwd_kernel[grid](
             q=q_new,
             k=k_new,
@@ -794,6 +993,7 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
             num_stages=num_stages,
             num_warps=num_warps
         )
+
         grid = (triton.cdiv(T, BS), B * H)
         # save_intra_chunk_attn[grid](
                 # A=attn, A_local=A_local, T=T, BT=BS
@@ -813,17 +1013,18 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
         B, H, T, K, V = *k.shape, v.shape[-1]
         BT_large = T
         assert q.shape[-1] <= 128, 'The maximum supported sequence length is 128.'
-        BT, BS = 64, 64
+        BT, BS = 128, 64
         BK = triton.next_power_of_2(k.shape[-1])
         BV = triton.next_power_of_2(v.shape[-1])
         scale = ctx.scale
         assert BT % BS == 0
         delta = torch.empty_like(L_new)
-        grid = (triton.cdiv(T, BT), H*B)
+        grid = (triton.cdiv(T, BS), H*B)
+
         _bwd_preprocess_kernel[grid](
             o, do,
             delta,
-            T, BT, V, BV
+            T, BS, V, BV
         )
 
         A = fwd_prepare_T(w, beta, None,  None, True, BS)
@@ -836,7 +1037,7 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
         BT_large = 256
         NT_large = triton.cdiv(T, BT_large)
 
-        q_large_new = torch.zeros(NT_large + 1, B, H, T, K, dtype=q.dtype, device=q.device)
+        q_large_new = torch.empty(NT_large + 1, B, H, T, K, dtype=q.dtype, device=q.device)
         k_large_new = None
         A_qk = None
 
@@ -858,19 +1059,20 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
             BT_large=BT_large
         )
 
-        # debug = False
+        # debug = True
 
         # if debug:
-        #     A_qk_ref = torch.zeros_like(A_qk)
+        #     # A_qk_ref = torch.zeros_like(A_qk)
         #     q_large_new_ref = torch.zeros_like(q_large_new)
-        #     k_large_new_ref = torch.zeros_like(k_large_new)
+        #     # k_large_new_ref = torch.zeros_like(k_large_new)
+        #     BT = 64
         #     for i_start in range(0, T, BT):
         #         curr_end = math.floor((i_start) / BT_large) * BT_large
         #         q_i = q_new[:, :, i_start:i_start+BT].clone().float()
         #         q_i_shape = q_i.shape
         #         for j_start in range(i_start - BS, curr_end - BS, -BS):
-        #             k_j = k_new[:, :, j_start:j_start+BS].clone()
-        #             A_qk_ref[:, :, i_start:i_start+BT, j_start-curr_end:j_start+BS-curr_end] = q_i.to(k_j) @ k_j.transpose(-1, -2)
+        #             # k_j = k_new[:, :, j_start:j_start+BS].clone()
+        #             # A_qk_ref[:, :, i_start:i_start+BT, j_start-curr_end:j_start+BS-curr_end] = q_i.to(k_j) @ k_j.transpose(-1, -2)
         #             h_idx = j_start // BS
         #             q_i = q_i - q_i.to(h) @ h[:, :, h_idx]
         #             assert q_i.shape == q_i_shape, breakpoint()
@@ -881,31 +1083,25 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
         #             q_i = q_i - q_i.to(h) @ h[:, :, h_idx]
         #             if j_start % BT_large == 0:
         #                 q_large_new_ref[j_start // BT_large, :, :, i_start:i_start+BT] = q_i
-        
-        #     for i_start in range(0, T, BT):
-        #         curr_end = (math.floor((i_start) / BT_large) + 1) * BT_large
-        #         k_i = k_new[:, :, i_start:i_start+BT].clone().float()
-        #         for j_start in range(i_start + BS, curr_end, BS):
-        #             h_idx = j_start // BS
-        #             k_i = k_i - k_i.to(h) @ h[:, :, h_idx].transpose(-1, -2)
-        #         k_large_new_ref[:, :, i_start:i_start+BT] = k_i
-            
+        #     BT = 128
+        #     # breakpoint()
+
         #     # (k_large_new-k_large_new_ref)[:,:,0:256]
         #     # get_err_ratio(k_large_new[:,:,:256], k_large_new_ref[:, :, :256])
-        #     a1 = q_large_new[1,:,:, 256:512] @ k_large_new_ref[:,:,:256].transpose(-1, -2)
-        #     a2 = q_large_new[1,:, :, 256:512] @ k_large_new[:,:,:256].transpose(-1, -2)
+        #     # a1 = q_large_new[1,:,:, 256:512] @ k_large_new_ref[:,:,:256].transpose(-1, -2)
+        #     # a2 = q_large_new[1,:, :, 256:512] @ k_large_new[:,:,:256].transpose(-1, -2)
         #     # a1 = a1 * scale
         #     # a2 = a2 * scale
-        #     a3 = attn_logit[:,:,256:512, 0:64]
+        #     # a3 = attn_logit[:,:,256:512, 0:64]
         #     # breakpoint()
-        
+
         grid = (triton.cdiv(T, BT_large) - 1, B*H)
         hc = torch.zeros_like(h)
 
         chunk_cumprod_householder_fwd_kernel[grid](
             h=h,
             hc=hc,
-            BT=BT,
+            BT=BS,
             BT_large=BT_large,
             K=K,
             NT=triton.cdiv(T, BS),
@@ -913,13 +1109,12 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
         )
 
         dq = torch.empty_like(q)
-        dk = torch.zeros_like(k, dtype=torch.float32)
+        dk_new = torch.zeros_like(k, dtype=torch.float32)
         dv = torch.zeros_like(v, dtype=torch.float32)
         dh = torch.zeros_like(h, dtype=torch.float32)
-        grid = (triton.cdiv(T, BT), H*B)
-        # dA = torch.empty_like(A_qk, dtype=q.dtype)
 
-        parallel_softmax_delta_rule_bwd_kernel[grid](
+        grid2 = (triton.cdiv(T, BT), H*B)
+        parallel_softmax_delta_rule_bwd_kernel[grid2](
             q_large=q_large_new,
             k_large=k_large_new,
             k=k_new,
@@ -933,7 +1128,7 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
             D=delta,
             L=L_new,
             dq=dq,
-            dk=dk,
+            dk=dk_new,
             dh=dh,
             dv=dv,
             scale=scale,
@@ -948,17 +1143,89 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
             BV=BV,
             BT_large=BT_large,
             NT=triton.cdiv(T, BS),
-            NT_large=triton.cdiv(T, BT_large)
+            NT_large=triton.cdiv(T, BT_large),
+            num_warps=8,
+            num_stages=2
         )
 
-        # breakpoint()
-        # compute the gradient
+        grid3 = (triton.cdiv(T, BS), H*B)
+        dA_local = torch.empty_like(A_local, dtype=q.dtype)
+        dq_new = torch.empty_like(q_new)
+        dw = torch.empty_like(w, dtype=torch.float32)
+
+        parallel_softmax_delta_rule_bwd_kernel_stage2[grid3](
+            qo=q,
+            ko=k,
+            k=k_new,
+            q=q_new,
+            v=v,
+            h=h,
+            w=w,
+            beta=beta,
+            AT=A,
+            hc=hc,
+            A=A_qk,
+            A_local=A_local,
+            dA_local=dA_local,
+            dq_new=dq_new,
+            dA=None,
+            do=do,
+            D=delta,
+            L=L_new,
+            dq=dq,
+            dk=dk_new,
+            dh=dh,
+            dv=dv,
+            dw=dw,
+            scale=scale,
+            B=B,
+            H=H,
+            T=T,
+            K=K,
+            V=V,
+            BT=BS,
+            BS=BS,
+            BK=BK,
+            BV=BV,
+            BT_large=BT_large,
+            NT=triton.cdiv(T, BS),
+            NT_large=triton.cdiv(T, BT_large),
+            num_warps=4,
+            num_stages=1
+        )
+
+        dbeta = torch.empty_like(beta, dtype=torch.float32)
+        dk = torch.empty_like(k)
+        grid3 = (triton.cdiv(T, 64), H*B)
+
+        parallel_softmax_delta_rule_bwd_kernel_stage3[grid3](
+            ko=k,
+            qo=q,
+            w=w,
+            beta=beta,
+            AT=A,
+            dA_local=dA_local,
+            dq_new=dq_new,
+            dk_new=dk_new,
+            dw=dw,
+            dk=dk,
+            dbeta=dbeta,
+            dh=dh,
+            T=T,
+            K=K,
+            BT=BS,
+            BK=BK,
+            NT=triton.cdiv(T, BS),
+            num_warps=4,
+            num_stages=1
+        )
+        return dq, dk, dv, dw, dbeta, None
 
         A, q, k, v, w, dq_new, dk_new, dv, A_local, do = map(lambda x: rearrange(x, 'b h (n c) d -> b h n c d', c=BS), [A, q, k, v, w, dq, dk, dv, A_local, do])
         beta, L_new, delta = map(lambda x: rearrange(x, 'b h (n c) -> b h n c', c=BS), [beta, L_new, delta])
         w_beta = w * beta[..., None]
         A_local_softmax = (torch.exp2(A_local * 1.44269504 - L_new[..., None])).tril()
-        dv += A_local_softmax.transpose(-1, -2).to(do) @ do
+        # dv += A_local_softmax.transpose(-1, -2).to(do) @ do
         dA = do @ v.transpose(-1, -2)
         dA = ((dA - delta[..., None]) * A_local_softmax * scale).tril()
 
@@ -972,7 +1239,6 @@ class ParallelDeltaRuleFunction(torch.autograd.Function):
 
             mask = torch.triu(torch.ones(BS, BS, dtype=torch.bool, device=q.device), diagonal=0)
             # Scale q directly instead of creating a new tensor
-
             # Calculate intermediate values
             Twbk = A @ (w_beta @ k.transpose(-1, -2)).masked_fill(mask, 0)
             qw = (q @ w.transpose(-1, -2)).tril() 
@@ -1198,32 +1464,42 @@ def parallel_attn(q, k, v, w, beta, scale):
     return A
 
 
-
 if __name__ == "__main__":
-    B, H, T, K, V = 1, 1, 2048, 64, 64
-    torch.set_default_dtype(torch.bfloat16)
+    import os
+    # os.environ['TRITON_F32_DEFAULT'] = 'ieee'
+    # torch.backends.cuda.matmul.allow_tf32 = False
+    # torch.backends.cudnn.allow_tf32 = False
+    # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # 可选，用于调试
+    # os.environ['NVIDIA_TF32_OVERRIDE'] = '0'  # 禁用 CUDA 的 TF32
 
+    B, H, T, K, V = 1, 1, 1024, 64, 64
+
+    torch.set_default_dtype(torch.bfloat16)
     q = torch.rand(B, H, T, K).cuda()
     k = torch.rand(B, H, T, K).cuda()
-    w = torch.nn.functional.normalize(torch.rand(B, H, T, K).cuda(), p=2, dim=-1)
+    w = torch.nn.functional.normalize(torch.rand(B, H, T, K).cuda().float(), p=2, dim=-1).to(q)
+    # w = torch.zeros(B, H, T, K).cuda()
+    # 在最后一个维度（K 维度）上随机选择索引
+    # indices = torch.randint(0, K, (B, H, T), device="cuda")
+    # 生成索引，并在相应位置赋值为 1
+    # w.scatter_(-1, indices.unsqueeze(-1), 1)
+
     # k = w.clone()
     v = torch.rand(B, H, T, V).cuda()
     beta = torch.rand(B, H, T).sigmoid().cuda()
+
     # beta = torch.ones(B, H, T).cuda()
     q, k, v, w, beta = map(lambda x: x.requires_grad_(True), [q, k, v, w, beta])
     output_attentions = True
-
     # attn2 = parallel_attn(q.clone(), k.clone(), v.clone(), w.clone(), beta.clone(), K**-0.5)
     o2 = parallel_hope(q.clone(), k.clone(), v.clone(), w.clone(), beta.clone(), K**-0.5)
     do2 = torch.randn_like(o2)
     o2.backward(do2)
-    
 
     # ref_attn = naive_delta_rule_parallel(q.clone(), k.clone(), v.clone(), w.clone(), beta.clone(), K**-0.5)
     # ref_o = ref_attn.float().softmax(-1).to(v) @ v
     # print(get_err_ratio(o2, ref_o))
     # # breakpoint()
-
     # print(get_err_ratio(attn2[:,:,32:64,:32], ref_attn[:, :, 32:64,:32]))
     # print(get_err_ratio(attn2[:,:,64+32:64+64,:32], ref_attn[:, :, 64+32:64+64,:32]))
     # print(get_err_ratio(attn2[:,:,-128:,:32], ref_attn[:, :, -128:,:32]))
@@ -1331,13 +1607,13 @@ if __name__ == "__main__":
     o3.backward(do2)
 
     print(get_err_ratio(o3, o2))
-    # print(get_err_ratio(o3, ref_o))
-    # print(get_err_ratio(o2, ref_o))
-    # (q_grad - q_origin.grad)[:,:,64]
-    print(get_err_ratio(q_grad[:,:,:256], q2.grad[:,:,:256]))
-    print(get_err_ratio(q_grad[:,:,256:], q2.grad[:,:,256:]))
+    print(get_err_ratio(q_grad, q2.grad))
     print(get_err_ratio(v_grad, v2.grad))
     print(get_err_ratio(k_grad, k2.grad))
     print(get_err_ratio(w_grad, w2.grad))
-    print(get_err_ratio(beta_grad, beta2.grad))    
+    # print(get_err_ratio(w_grad[:,:,64:], w2.grad[:,:,64:]))
+    print(get_err_ratio(beta_grad, beta2.grad))
     breakpoint()
+
+
+
